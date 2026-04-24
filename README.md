@@ -7,6 +7,10 @@ at five long-record meteorological stations in the Netherlands, structured as a 
 document. It demonstrates methods directly applicable to **natural catastrophe (nat cat)
 modelling** in the insurance and reinsurance industry.
 
+## Live report
+
+👉 https://risam0arek.github.io/precipitation-extremes-gev-copula/
+
 ## What's in the analysis
 
 | Section | Methods |
