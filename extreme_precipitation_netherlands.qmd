@@ -1,0 +1,1060 @@
+---
+title: "Extreme Precipitation in the Netherlands: GEV Modelling & Extreme Value Copulas"
+author: "Richard Marek (Condensed English version of a Master's thesis practical chapter)"
+date: today
+bibliography: references.bib
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+    fig-align: center
+    df-print: kable
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(geosphere)
+library(tidyr)
+library(lubridate)
+library(extRemes)
+library(gridExtra)
+library(copula)
+library(ggrepel)
+library(evd)
+library(GGally)
+library(reshape2)
+library(stringr)
+library(knitr)
+library(kableExtra)
+library(purrr)
+```
+
+---
+
+## Why This Matters: Application to Natural Catastrophe Modelling {#motivation}
+
+Before presenting the methodology, it is useful to briefly outline the relevance of extreme value theory and copula-based dependence modelling in **natural catastrophe (nat cat) modelling** within the insurance and reinsurance industry.
+
+Extreme precipitation events are a key driver of flood losses in property insurance portfolios. Modern catastrophe models decompose risk into hazard, vulnerability, exposure, and financial loss components.
+
+This analysis focuses on the hazard component by modelling both the marginal behaviour of extreme precipitation and its spatial dependence structure. The resulting framework can be used to generate stochastic event sets for portfolio-level risk assessment.
+
+Nat cat models — developed by vendors such as Moody's (formerly RMS), Verisk
+(formerly AIR Worldwide), and PERILS — decompose catastrophic risk into four components:
+
+| Component | Description |
+|-----------|-------------|
+| **Hazard** | Probability of a damaging natural event at a given location and time |
+| **Vulnerability** | Degree of loss as a function of event intensity |
+| **Element at risk** | The exposed portfolio (insured values, locations, construction types) |
+| **Risk** | Expected loss = Hazard × Vulnerability |
+
+The **hazard module** is where extreme value theory comes in. GEV distributions and extreme
+value copulas are the natural tools for modelling the frequency and severity of extreme
+precipitation — and, critically, whether extremes at multiple locations occur *simultaneously*.
+
+**Why simultaneous extremes matter for pricing:** A flood affecting a single city is
+manageable. A flood affecting five cities at once can exhaust reinsurance capacity.
+The key insight from this analysis — demonstrated numerically in the copula section — is that
+even weak dependence between stations raises the probability of simultaneous exceedance
+by **14× to 98× compared to the independence assumption**. Ignoring this leads to
+systematic underestimation of aggregate Probable Maximum Loss (PML) and incorrect
+Excess of Loss pricing.
+
+### Directions for Further Development
+
+The framework used here covers **marginal GEV fitting + bivariate extreme value copulas**,
+corresponding to the first layer of a full nat cat hazard model. Natural extensions include:
+
+- **Vine copulas** — decompose multivariate dependence into a cascade of bivariate copulas,
+  one per pair (possibly conditional), allowing different copula families for each pair.
+  This is far more flexible than a single 5D Gumbel copula with one parameter.
+  See @Simpson2021 for vine copulas in an extreme value context.
+
+- **Hierarchical (nested) Archimedean copulas** — stations are grouped by similarity;
+  within-group dependence uses a copula with its own parameter, groups are then joined
+  by a higher-level copula. The Gumbel copula is the only family that is simultaneously
+  Archimedean and an extreme value copula, making it the natural choice here.
+
+- **Copula averaging** — rather than selecting a single best copula, combine candidates
+  as a weighted average (weights from AIC or BIC). The resulting model is not
+  max-stable, but is a valid copula and is more robust under model uncertainty.
+
+- **Spatial Bayesian hierarchical models** — GEV parameters (μ, σ, ξ) are modelled
+  as spatially varying functions of location and covariates (e.g. elevation, distance
+  from the coast). This allows *borrowing of information* between stations and produces
+  full spatial return-level maps with uncertainty quantification. See @Bracken2021
+  for a three-layer implementation: data layer (GEV + Gaussian copula), process layer
+  (spatial regression per parameter), and spatial variability layer (radial basis functions).
+  This type of output feeds directly into stochastic event set generation.
+
+**From stochastic events to risk metrics:** Given a stochastic event set (typically
+10,000+ synthetic years), each event is propagated through a vulnerability function to
+produce insured losses per object. Aggregated across the portfolio, the loss distribution
+supports calculation of:
+
+- **AAL** (Average Annual Loss) — long-run expected annual loss; basis for rate-making
+- **VaR** at 1-in-100 or 1-in-250 — regulatory capital and Excess of Loss attachment points
+- **TVaR / Expected Shortfall** — mean loss in worst scenarios; a coherent risk measure
+
+---
+
+## Data
+
+Daily precipitation totals were downloaded from the
+[NOAA National Centers for Environmental Information (NCEI)](https://www.ncei.noaa.gov/products/land-based-station/global-historical-climatology-network-daily)
+for five long-record stations in the Netherlands. The primary selection criterion was
+record length and completeness, which is essential for reliable extreme value analysis.
+
+```{r load-data}
+data1 <- read.csv("4257416.csv", header = TRUE)
+
+data1 <- data1 %>%
+  mutate(
+    NAME = gsub(",.*", "", NAME),
+    NAME = gsub("\\d+", "", NAME),
+    NAME = trimws(NAME),
+    NAME = ifelse(NAME == "PUTTEN GLD", "PUTTEN", NAME),
+    NAME = str_to_title(NAME),
+    DATE = as.Date(DATE),
+    PRCP = PRCP * 25.4   # inches → mm
+  )
+
+station_names <- unique(data1$NAME)
+
+station_raw <- setNames(
+  lapply(station_names, function(s) data1[data1$NAME == s, c("DATE", "PRCP")]),
+  station_names
+)
+
+coords <- data1 %>%
+  filter(NAME %in% station_names) %>%
+  select(NAME, LATITUDE, LONGITUDE) %>%
+  distinct()
+```
+
+### Station Map
+
+```{r station-map, fig.cap="Location of the five meteorological stations in the Netherlands."}
+nl_map <- map_data("world") %>% filter(region == "Netherlands")
+
+ggplot() +
+  geom_polygon(data = nl_map, aes(x = long, y = lat, group = group),
+               fill = "lightyellow", color = "black") +
+  geom_point(data = coords, aes(x = LONGITUDE, y = LATITUDE),
+             color = "red", size = 3) +
+  geom_text_repel(data = coords,
+                  aes(x = LONGITUDE, y = LATITUDE, label = NAME),
+                  size = 3.5, color = "black") +
+  coord_fixed(1.3) +
+  theme_minimal() +
+  theme(axis.title = element_blank(), axis.text = element_blank(),
+        axis.ticks = element_blank(), panel.grid = element_blank())
+```
+
+### Inter-station Distances
+
+Stations at smaller geographic distances are expected to show stronger precipitation
+dependence. Elevation ranges only from −3 to 20 m above sea level across all five
+stations and is therefore not considered further.
+
+```{r distances}
+dist_matrix_km <- distm(coords[, c("LONGITUDE","LATITUDE")],
+                        fun = distVincentyEllipsoid) / 1000
+
+colnames(dist_matrix_km) <- rownames(dist_matrix_km) <- coords$NAME
+
+dist_unique <- as.data.frame(dist_matrix_km) %>%
+  mutate(STATION1 = coords$NAME) %>%
+  pivot_longer(cols = -STATION1, names_to = "STATION2", values_to = "distance_km") %>%
+  mutate(ST1 = pmin(STATION1, STATION2), ST2 = pmax(STATION1, STATION2)) %>%
+  select(STATION1 = ST1, STATION2 = ST2, distance_km) %>%
+  distinct() %>%
+  filter(distance_km > 0) %>%
+  arrange(distance_km) %>%
+  mutate(distance_km = round(distance_km, 1))
+
+kable(dist_unique,
+      col.names = c("Station 1", "Station 2", "Distance (km)"),
+      caption = "Pairwise distances between stations (Vincenty ellipsoid method).") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover"))
+```
+
+---
+
+## Data Cleaning & Annual Maxima Extraction
+
+```{r cleaning}
+# EDA helper
+compute_eda_row <- function(df, s, skip_yrs = character(0)) {
+  n_na       <- sum(is.na(df$PRCP))
+  full_dates <- seq(min(df$DATE), max(df$DATE), by = "day")
+  if (length(skip_yrs) > 0)
+    full_dates <- full_dates[!format(full_dates, "%Y") %in% skip_yrs]
+  n_missing <- length(setdiff(full_dates, df$DATE))
+  data.frame(Station       = s, Observations  = nrow(df),"Missing PRCP" = n_na,
+  "Missing Days" = n_missing, "Start Date"= min(df$DATE),"End Date" = max(df$DATE),
+             stringsAsFactors = FALSE)
+}
+
+# Identify problematic years (many missing values in 2021 and 2024)
+SKIP_YEARS <- c("2021", "2024")
+
+station_final <- setNames(
+  lapply(station_names, function(s) {
+    df         <- station_raw[[s]]
+    first_year <- as.numeric(format(min(df$DATE), "%Y"))
+    start_date <- as.Date(paste0(first_year, "-01-01"))
+    if (min(df$DATE) > start_date)
+      start_date <- as.Date(paste0(first_year + 1, "-01-01"))
+    df <- df[!format(df$DATE, "%Y") %in% SKIP_YEARS, ]
+    df[df$DATE >= start_date & df$DATE <= max(df$DATE, na.rm = TRUE), ]
+  }),
+  station_names
+)
+
+eda_final <- bind_rows(lapply(station_names, function(s)
+  compute_eda_row(station_final[[s]], s, skip_yrs = SKIP_YEARS)))
+
+kable(eda_final, caption = "Summary of cleaned daily data (years 2021 and 2024 excluded).") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+Years 2021 and 2024 were excluded due to a large number of missing values across all
+five stations. Where records did not begin on 1 January, the incomplete initial year
+was discarded so that each block corresponds to a full calendar year.
+
+```{r annual-maxima}
+station_ymax <- setNames(
+  lapply(station_names, function(s) {
+    station_final[[s]] %>%
+      mutate(YEAR = year(DATE)) %>%
+      group_by(YEAR) %>%
+      summarise(max_PRCP = max(PRCP, na.rm = TRUE), .groups = "drop")
+  }),
+  station_names
+)
+```
+
+### Annual Maxima Time Series
+
+```{r plot-maxima, fig.height=8, fig.cap="Annual maximum daily precipitation (mm) at each station."}
+ymax_long <- bind_rows(lapply(station_names, function(s)
+  station_ymax[[s]] %>% mutate(Station = s)))
+
+ggplot(ymax_long, aes(x = YEAR, y = max_PRCP)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "red", size = 1.2) +
+  facet_wrap(~ Station, ncol = 2) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Year", y = "Annual maximum precipitation (mm)") +
+  theme_minimal()
+```
+
+---
+
+## Assumption Checking for the Block Maxima Method
+
+The block maxima method requires annual maxima to be independent and identically
+distributed (i.i.d.). This cannot be verified directly; we therefore test necessary
+conditions: **independence** (via ACF) and **stationarity** (via LOESS trend).
+
+### Independence: Autocorrelation Functions
+
+```{r acf-plots, fig.height=9, fig.cap="Sample autocorrelation functions of annual maximum precipitation."}
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+for (s in station_names) {
+  acf(station_ymax[[s]]$max_PRCP,
+      main = s, xlab = "Lag (years)", ylab = "ACF")
+}
+```
+
+For most stations, autocorrelation values remain within the 95% confidence bands.
+Occasional exceedances (Groningen, Hoofddorp, Roermond) occur at higher lags without
+a clear physical interpretation and are consistent with random chance given the number
+of lags tested. No statistically significant autocorrelation is observed at low lags,
+so the independence assumption is not rejected at the 5% level.
+
+### Stationarity: LOESS Trend in Annual Maxima
+
+```{r loess-maxima, fig.height=8, fig.cap="Annual maxima with LOESS trend (shaded 95% CI)."}
+ggplot(ymax_long, aes(x = YEAR, y = max_PRCP)) +
+  geom_point(color = "red", alpha = 0.6, size = 1.2) +
+  geom_smooth(method = "loess", se = TRUE, color = "steelblue") +
+  facet_wrap(~ Station, ncol = 2) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Year", y = "Annual maximum precipitation (mm)") +
+  theme_minimal()
+```
+
+None of the five stations exhibits a strictly constant mean over time. The most
+pronounced non-stationarity is at **Roermond** (~10 mm upward trend) and
+**Hoofddorp** (strong recent increase). **Groningen** is closest to stationary behaviour.
+**Putten** shows an inverted-U pattern, **Den Helder** a non-monotone curve.
+
+A non-stationary GEV model with time-varying parameters would be more rigorous for these
+stations (see @Katz for methods), but is beyond the scope of this analysis.
+Results should be interpreted with this limitation in mind.
+
+### LOESS Trend in Daily Data (All Observations)
+
+```{r loess-daily, fig.height=8, fig.cap="LOESS trend fitted to all daily precipitation observations (individual points omitted due to volume)."}
+daily_long <- bind_rows(lapply(station_names, function(s)
+  station_final[[s]] %>% mutate(Station = s)))
+
+ggplot(daily_long, aes(x = DATE, y = PRCP)) +
+  geom_smooth(method = "loess", se = FALSE, color = "steelblue") +
+  facet_wrap(~ Station, ncol = 2) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Year", y = "Daily precipitation (mm)") +
+  theme_minimal()
+```
+
+Comparing daily and annual-maxima trends reveals that changes in overall precipitation
+volumes do not always translate directly into changes in extreme behaviour.
+
+---
+
+## GEV Distribution Fitting
+
+### Parameter Estimates
+
+Annual maxima at each station are modelled with a Generalised Extreme Value (GEV)
+distribution, $F(x;\mu,\sigma,\xi)$, estimated by maximum likelihood.
+
+```{r gev-fit}
+params_table <- map_dfr(station_names, function(s) {
+  x   <- station_ymax[[s]]$max_PRCP
+  fit <- fgev(x)
+  ci  <- confint(fit)
+  tibble(Station = s,
+         mu = fit$est[1], sigma = fit$est[2], xi = fit$est[3],
+         mu_low = ci[1,1], mu_high = ci[1,2],
+         sigma_low = ci[2,1], sigma_high = ci[2,2],
+         xi_low = ci[3,1], xi_high = ci[3,2])
+})
+
+params_table %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  kable(
+    col.names = c("Station",
+                  "μ", "σ", "ξ",
+                  "low", "high", "low", "high", "low", "high"),
+    caption = "GEV parameter estimates with 95% confidence intervals."
+  ) %>%
+  add_header_above(c(" " = 1,
+                     "Estimate" = 3,
+                     "μ CI" = 2,
+                     "σ CI" = 2,
+                     "ξ CI" = 2)) %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+The location parameter $\hat\mu$ is highest at Hoofddorp (29.68 mm). For Groningen,
+Roermond, and Hoofddorp, the 95% CI for $\xi$ includes zero, making the Gumbel
+distribution statistically acceptable. Den Helder and Putten show a mildly positive
+$\hat\xi$ with CI excluding zero, indicating a slightly heavier upper tail.
+
+### Diagnostic Plots
+
+```{r gev-diagnostics, fig.height=10, fig.cap="GEV diagnostic plots for each station (histogram, KDE, ECDF, Q–Q, P–P)."}
+plot_station_gev <- function(s, station_ymax, params_table) {
+  x  <- station_ymax[[s]]$max_PRCP
+  pars  <- params_table[params_table$Station == s, ]
+  mu    <- pars$mu; sigma <- pars$sigma; xi <- pars$xi
+  m     <- length(x)
+  x_seq <- seq(min(x) * 0.9, max(x) * 1.15, length.out = 300)
+  gev_df <- data.frame(x = x_seq,
+                       pdf = dgev(x_seq, mu, sigma, xi),
+                       cdf = pgev(x_seq, mu, sigma, xi))
+
+  p1 <- ggplot(data.frame(x = x), aes(x = x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 15,
+                   fill = "steelblue", alpha = 0.5, color = "white") +
+    geom_line(data = gev_df, aes(x = x, y = pdf), color = "red", linewidth = 1) +
+    labs(x = "Annual max. precipitation", y = "Density") + theme_minimal()
+
+  p2 <- ggplot(data.frame(x = x), aes(x = x)) +
+    geom_density(fill = "steelblue", alpha = 0.4, color = "steelblue") +
+    geom_line(data = gev_df, aes(x = x, y = pdf), color = "red", linewidth = 1) +
+    labs(x = "Annual max. precipitation", y = "Density") + theme_minimal()
+
+  ecdf_df <- data.frame(x = sort(x), ecdf = (1:m)/m)
+  p3 <- ggplot(ecdf_df, aes(x = x, y = ecdf)) +
+    geom_step(color = "steelblue", linewidth = 0.8) +
+    geom_line(data = gev_df, aes(x = x, y = cdf), color = "red", linewidth = 1) +
+    labs(x = "Annual max. precipitation", y = "CDF") + theme_minimal()
+
+  qq_df <- data.frame(theoretical = qgev((1:m - 0.5)/m, mu, sigma, xi),
+                      empirical   = sort(x))
+  p4 <- ggplot(qq_df, aes(x = theoretical, y = empirical)) +
+    geom_point(color = "steelblue", alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+    labs(x = "Theoretical quantiles", y = "Empirical quantiles") + theme_minimal()
+
+  pp_df <- data.frame(theoretical = pgev(sort(x), mu, sigma, xi),
+                      empirical   = (1:m)/(m+1))
+  p5 <- ggplot(pp_df, aes(x = theoretical, y = empirical)) +
+    geom_point(color = "steelblue", alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+    labs(x = "Theoretical probability", y = "Empirical probability") + theme_minimal()
+
+  gridExtra::grid.arrange(
+    p1, p2, p3, p4, p5,
+    top = grid::textGrob(s, gp = grid::gpar(fontsize = 13, fontface = "bold")),
+    ncol = 2)
+}
+
+for (s in station_names) plot_station_gev(s, station_ymax, params_table)
+```
+
+Overall, the GEV model fits well for Groningen, Roermond, and Hoofddorp. Den Helder
+shows some underestimation of high quantiles (Q–Q plot, upper tail). Putten exhibits a
+hint of bimodality, leading to larger Q–Q deviations in the middle range, and a clear
+outlier in the upper tail where the theoretical model substantially overestimates.
+
+### Return Level Plots
+
+```{r return-levels, fig.height=9, fig.cap="Return level plots with 95% bootstrap confidence intervals (3rd and 97th percentile from 99 replications)."}
+rl_ggplot <- function(s, station_ymax, params_table, xlim = c(1, 200)) {
+  x   <- station_ymax[[s]]$max_PRCP
+  fit <- fgev(x)
+  pars <- params_table[params_table$Station == s, ]
+  mu   <- pars$mu; sigma <- fit$param["scale"]; xi_s <- fit$param["shape"]
+
+  ppx     <- ppoints(fit$tdata, a = 0)
+  rps     <- c(1.001, 10^(seq(0, 3, len = 200))[-1])
+  p_upper <- 1 / rps
+  rlev    <- qgev(p_upper, loc = fit$loc, scale = sigma, shape = xi_s,
+                  lower.tail = FALSE)
+
+  df_pts  <- data.frame(rp  = -1/log(ppx),          obs  = sort(fit$tdata))
+  df_line <- data.frame(rp  = -1/log(1 - p_upper),  rlev = rlev)
+
+  # Bootstrap CI (3rd–97th percentile, 99 resamples)
+  samp <- rgev(fit$n * 99, loc = fit$loc, scale = sigma, shape = xi_s)
+  samp <- matrix(samp, fit$n, 99)
+  samp <- apply(samp, 2, sort)
+  samp <- apply(samp, 1, sort)
+  env  <- t(samp[c(3, 97), ])
+  df_ci <- data.frame(rp = -1/log(ppx), lo = env[,1], hi = env[,2])
+
+  ggplot() +
+    geom_errorbar(data = df_ci, aes(x = rp, ymin = lo, ymax = hi),
+                  width = 0, color = "steelblue", alpha = 0.3) +
+    geom_line(data = df_line, aes(x = rp, y = rlev)) +
+    geom_point(data = df_pts,  aes(x = rp, y = obs), shape = 20) +
+    scale_x_log10(breaks = c(1,2,5,10,20,50,100,200),
+                  labels = c("1","2","5","10","20","50","100","200")) +
+    coord_cartesian(xlim = xlim) +
+    labs(title = s, x = "Return period (years)", y = "Return level (mm)") +
+    theme_minimal()
+}
+
+plots_rl <- lapply(station_names, rl_ggplot,
+                   station_ymax = station_ymax, params_table = params_table)
+gridExtra::grid.arrange(grobs = plots_rl, ncol = 2)
+```
+
+Groningen and Hoofddorp show the tightest confidence bands and best model–data alignment.
+Den Helder systematically underestimates high quantiles (empirical points above curve).
+Putten shows very wide CIs for return periods > 50 years, reflecting high variability
+in its input time series.
+
+### GEV-based Risk Metrics
+
+```{r gev-metrics}
+THRESHOLD <- 80   # mm
+K_YEAR    <- 100  # k-year return level
+
+gev_metrics <- map_dfr(params_table$Station, function(s) {
+  pars  <- params_table[params_table$Station == s, ]
+  mu    <- pars$mu; sigma <- pars$sigma; xi <- pars$xi
+
+  p_yr  <- 1 - pgev(THRESHOLD, mu, sigma, xi)  # annual exceedance prob.
+  p_day <- 1 - pgev(THRESHOLD, mu, sigma, xi)^(1/365)  # daily exceedance prob.
+
+  tibble(
+    Station              = s,
+    annual_exceedance    = round(p_yr, 4),
+    daily_exceedance     = signif(p_day, 3),
+    return_level_100yr   = round(qgev(1 - 1/K_YEAR, mu, sigma, xi), 2),
+    return_period_80mm   = round(1/p_yr, 1)
+  )
+})
+
+gev_metrics %>%
+  kable(col.names = c("Station", "Annual P(X > 80 mm)",
+                      "Daily P(X > 80 mm)",
+                      "100-year return level (mm)",
+                      "Return period for 80 mm (years)"),
+        caption = "GEV-based extreme precipitation statistics (threshold = 80 mm).") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+Putten has the highest annual exceedance probability (0.0078) with a return period of
+~128 years for 80 mm, while Hoofddorp is the most conservative (return period ~1487 years).
+The 100-year return level ranges from ~63 mm (Hoofddorp) to ~76 mm (Putten).
+
+---
+
+## Dependence Analysis
+
+Before fitting copulas, we quantify pairwise dependence using two complementary approaches. Rank-based measures (Kendall's τ and Spearman's ρ) capture monotone dependence across the full distribution and are invariant to marginal transformations, so they can be applied to the original data directly. Tail dependence coefficients focus specifically on the probability that both variables are simultaneously extreme, which is the quantity most relevant for catastrophe risk. We also compare dependence estimated from annual maxima against daily data, as the two can differ substantially.
+
+### Rank-based Correlation: Annual Maxima
+
+```{r rank-corr}
+# Common years across all stations
+common_years <- Reduce(intersect, lapply(station_ymax, function(df) df$YEAR))
+n_obs        <- length(common_years)
+n_stations   <- length(station_names)
+
+yearmax_common <- lapply(station_ymax, function(df) {
+  df2 <- df[df$YEAR %in% common_years, ]
+  df2[order(df2$YEAR), ]
+})
+
+X_matrix <- matrix(NA, nrow = n_obs, ncol = n_stations,
+                   dimnames = list(common_years, station_names))
+for (s in station_names)
+  X_matrix[, s] <- yearmax_common[[s]]$max_PRCP
+```
+
+```{r kendall-tau, fig.cap="Kendall's τ between stations (annual maxima)."}
+tau_matrix <- cor(X_matrix, method = "kendall")
+
+tau_df <- as.data.frame(as.table(tau_matrix))
+ggplot(tau_df, aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Freq, 2)), size = 4) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, name = expression(tau)) +
+  coord_fixed() + theme_minimal() +
+  labs(title = "Kendall's τ", x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r spearman-ymax, fig.cap="Spearman's ρ between stations (annual maxima)."}
+spearman_ymax <- cor(X_matrix, method = "spearman")
+
+spearman_df <- as.data.frame(as.table(spearman_ymax))
+ggplot(spearman_df, aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Freq, 2)), size = 4) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, name = expression(rho)) +
+  coord_fixed() + theme_minimal() +
+  labs(title = "Spearman's ρ", x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+All pairwise dependences are positive but weak. Spearman's ρ ranges from 0.11 to 0.24,
+Kendall's τ from 0.07 to 0.17. The strongest pair is Groningen–Putten (ρ = 0.24),
+consistent with their shared exposure to similar weather systems.
+Geography explains dependence only partially: Groningen–Putten (123 km) and
+Groningen–Den Helder (127 km) are nearly equidistant, yet show different correlations.
+
+### Spearman's ρ: Daily Data Comparison
+
+```{r spearman-daily, fig.height=10, fig.cap="Spearman's ρ from daily data under three conditioning scenarios."}
+common_dates <- Reduce(intersect, lapply(station_final, function(df) df$DATE))
+common_dates <- as.Date(common_dates, origin = "1970-01-01")
+
+D_matrix <- matrix(NA, nrow = length(common_dates), ncol = n_stations,
+                   dimnames = list(as.character(common_dates), station_names))
+for (s in station_names) {
+  df <- station_final[[s]]
+  df <- df[df$DATE %in% common_dates, ]
+  D_matrix[, s] <- df[order(df$DATE), "PRCP"]
+}
+
+compute_spearman_rain <- function(D_matrix, mode = c("either","both")) {
+  mode <- match.arg(mode)
+  d    <- ncol(D_matrix); nms <- colnames(D_matrix)
+  mat  <- matrix(NA, d, d, dimnames = list(nms, nms))
+  for (i in 1:d) for (j in i:d) {
+    x <- D_matrix[,i]; y <- D_matrix[,j]
+    valid <- if (mode == "either") (x > 0 | y > 0) else (x > 0 & y > 0)
+    val   <- cor(x[valid], y[valid], method = "spearman")
+    mat[i,j] <- mat[j,i] <- val
+  }
+  mat
+}
+
+sp_all    <- cor(D_matrix, method = "spearman")
+sp_either <- compute_spearman_rain(D_matrix, "either")
+sp_both   <- compute_spearman_rain(D_matrix, "both")
+
+plot_heatmap <- function(mat, title) {
+  df <- as.data.frame(as.table(mat))
+  ggplot(df, aes(Var1, Var2, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Freq, 2)), size = 3) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                         midpoint = 0, name = expression(rho)) +
+    coord_fixed() + theme_minimal() +
+    labs(title = title, x = "", y = "") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+gridExtra::grid.arrange(
+  plot_heatmap(sp_all,    "All days"),
+  plot_heatmap(sp_either, "At least one station raining"),
+  plot_heatmap(sp_both,   "Both stations raining"),
+  ncol = 2
+)
+```
+
+```{r rain-fraction}
+rain_frac <- sapply(station_names, function(s)
+  sum(station_final[[s]]$PRCP > 0) / nrow(station_final[[s]]))
+
+kable(t(round(rain_frac, 3)),
+      caption = "Fraction of days with positive precipitation at each station.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+Annual maxima show far weaker correlation (ρ ∈ [0.11, 0.24]) than daily data
+(ρ ∈ [0.44, 0.71] for all days). The inflated all-day values are partly artefactual:
+on 45–51% of days no rain falls at any station, creating many tied (0, 0) pairs
+that artificially boost rank correlation. Conditioning on days when both stations rain
+gives ρ ∈ [0.21, 0.59], closer to the true precipitation dependence.
+
+This pattern — extremes showing weaker spatial dependence than everyday rain — is
+well-documented and reflects that extreme precipitation is driven by different
+meteorological mechanisms than routine events.
+
+### Tail Dependence Coefficients
+
+```{r tail-dep, fig.cap="Empirical upper (λᵤ) and lower (λₗ) tail dependence coefficients between all pairs."}
+k_td <- round(sqrt(n_obs))  # ≈ √155 ≈ 12
+
+lambda_lower <- function(X1, X2, k) {
+  n <- length(X1); r <- rank(X1, ties.method = "average")
+  s <- rank(X2, ties.method = "average")
+  sum(r <= (n+1)/n*k & s <= (n+1)/n*k) / k
+}
+lambda_upper <- function(X1, X2, k) {
+  n <- length(X1); r <- rank(X1, ties.method = "average")
+  s <- rank(X2, ties.method = "average")
+  thr <- n + 1 - (n+1)/n*k
+  sum(r > thr & s > thr) / k
+}
+
+lam_l <- matrix(NA, n_stations, n_stations,
+                dimnames = list(station_names, station_names))
+lam_u <- matrix(NA, n_stations, n_stations,
+                dimnames = list(station_names, station_names))
+
+for (i in 1:n_stations) for (j in 1:n_stations) {
+  if (i == j) { lam_l[i,j] <- 1; lam_u[i,j] <- 1
+  } else {
+    lam_l[i,j] <- lambda_lower(X_matrix[,i], X_matrix[,j], k_td)
+    lam_u[i,j] <- lambda_upper(X_matrix[,i], X_matrix[,j], k_td)
+  }
+}
+
+plot_tail <- function(mat, legend_label, title) {
+  df <- reshape2::melt(mat, na.rm = TRUE)
+  ggplot(df, aes(Var2, Var1, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = round(value, 2)), size = 3.5, color = "black") +
+    scale_fill_gradient(low = "#FFCCCC", high = "#CC0000",
+                        limits = c(0, 1), name = legend_label) +
+    coord_fixed() + labs(x = NULL, y = NULL, title = title) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9))
+}
+
+gridExtra::grid.arrange(
+  plot_tail(lam_u, expression(lambda[u]), expression("Upper tail dependence " ~ lambda[u])),
+  plot_tail(lam_l, expression(lambda[l]), expression("Lower tail dependence " ~ lambda[l])),
+  ncol = 2
+)
+```
+
+Most pairs show $\hat\lambda_{u,n} = \hat\lambda_{l,n} = 0.08 = 1/12$, the minimum
+non-zero value achievable with $k = 12$. Exceptions: Groningen–Putten, Roermond–Putten,
+and Hoofddorp–Putten show $\hat\lambda_{u,n} = 0.17$–$0.25$. These estimates should be
+treated as indicative only: with $n = 155$, $k \approx \sqrt{n} = 12$, and estimates
+constrained to multiples of $1/12$, the resolution is very coarse.
+
+As noted by @Serinaldi, standard estimators of $\hat\lambda_u$ can suffer from severe
+bias and high variance. The apparent inconsistency between copula-selected dependence
+strength and tail coefficient estimates is likely an artefact of estimator unreliability
+rather than a true contradiction.
+
+---
+
+## Copula Analysis
+
+By Sklar's theorem, any joint distribution can be decomposed into its marginal distributions and a copula that captures the dependence structure between them. This separation is particularly useful here: the marginal GEV distributions fitted in the previous section describe how extreme precipitation behaves at each station individually, while the copula describes how those extremes co-occur across stations. We focus on **extreme value copulas**, a subclass characterised by max-stability — the same property that makes GEV distributions the natural limit for block maxima. This theoretical consistency between the marginal and dependence models is what justifies the approach for extremes, as opposed to using general-purpose copulas such as the Gaussian or Clayton.
+
+### Transformation to Uniform Marginals
+
+Before fitting copulas, the marginal distribution of each station must be transformed to an approximate $U(0,1)$ distribution, in accordance with Sklar's theorem. Two approaches are implemented:
+
+- **Parametric (IFM):**  
+
+  $$\hat{u}_{i,j} = F_i(x_{i,j}; \hat{\phi}_i),$$
+  
+  where $F_i(\cdot  ; \hat{\phi}_i)$ is is the GEV distribution function with parameters    $\hat{\phi}_i= \left(\hat{\mu}, \ \hat{\sigma}, \ \hat{\xi}\right)$ estimated in the      previous section. This approach propagates uncertainty from the marginal fit into the     pseudo-observations.
+
+- **Semi-parametric (MPL):** 
+
+  $$\tilde{u}_{i,j} = \frac{n}{n+1} \hat{F}_i(x_{i,j}), \quad \hat{F}_i(x) = \frac{1}{n} \sum_{k=1}^n \mathbf{1}(x_{i,k} \le x). $$  
+  Marginal distributions are left unspecified and observations are transformed via their    empirical ranks. The scaling factor $\frac{n}{n+1}$ (Hazen correction) ensures            pseudo-observations lie strictly inside $(0,1)$, avoiding numerical issues when           evaluating copula densities at the boundary — the standard empirical CDF with             denominator $n$ can attain the value 1 exactly.
+
+
+```{r transform-U}
+U_param <- matrix(NA, nrow = n_obs, ncol = n_stations,
+                  dimnames = list(common_years, station_names))
+for (s in station_names) {
+  pars <- params_table[params_table$Station == s, ]
+  U_param[, s] <- evd::pgev(yearmax_common[[s]]$max_PRCP,
+                             loc = pars$mu, scale = pars$sigma, shape = pars$xi)
+}
+
+U_matrix <- matrix(NA, nrow = n_obs, ncol = n_stations,
+                   dimnames = list(common_years, station_names))
+for (s in station_names) {
+  x <- yearmax_common[[s]]$max_PRCP
+  m <- length(x)
+  U_matrix[, s] <- rank(x, ties.method = "average") / (m + 1)
+}
+```
+
+```{r hist-uniform, fig.cap="Histograms of transformed values for each station. Red line = U(0,1) reference density."}
+plot_u_hist <- function(U, title) {
+  as.data.frame(U) %>%
+    pivot_longer(everything(), names_to = "station", values_to = "u") %>%
+    ggplot(aes(x = u, y = after_stat(density))) +
+    geom_histogram(binwidth = 0.1, fill = "steelblue", alpha = 0.6, color = "white") +
+    geom_hline(yintercept = 1, color = "red", linewidth = 0.7) +
+    scale_x_continuous(breaks = c(0, 0.5, 1)) +
+    facet_wrap(~ station, nrow = 1) +
+    labs(title = title, x = "Probability", y = "Density") +
+    theme_minimal()
+}
+
+gridExtra::grid.arrange(
+  plot_u_hist(U_param,  "Parametric transformation (IFM)"),
+  plot_u_hist(U_matrix, "Semi-parametric transformation (MPL / Hazen)"),
+  ncol = 1
+)
+```
+
+The semi-parametric transformation produces histograms much closer to the uniform
+reference, confirming that the fitted GEV distributions do not describe the empirical
+distribution perfectly. All subsequent copula fitting uses the semi-parametric pseudo-observations.
+
+```{r scatter-uniform, fig.cap="Pairwise scatter plots of semi-parametric pseudo-observations. Weak but non-zero dependence is visible."}
+ggpairs(as.data.frame(U_matrix),
+        lower = list(continuous = wrap("points", alpha = 0.3, size = 0.7, color = "steelblue")),
+        diag  = list(continuous = wrap("densityDiag", fill = "steelblue", alpha = 0.4)),
+        upper = list(continuous = wrap("points", alpha = 0.3, size = 0.7, color = "steelblue"))) +
+  scale_x_continuous(breaks = c(0, 1)) +
+  scale_y_continuous(breaks = c(0, 1)) +
+  theme_minimal()
+```
+
+### Bivariate Extreme Value Copula Selection
+
+For each of the $\binom{5}{2} = 10$ station pairs, five extreme value copula families
+are fitted by maximum pseudo-likelihood (MPL) and ranked by AIC:
+Gumbel, Galambos, Hüsler–Reiss, t-EV, and Tawn (symmetric implementation).
+
+Note: The Joe extreme value copula is not available in the `copula` package (the Joe
+Archimedean copula is a different family); it is therefore excluded.
+
+```{r copula-functions}
+draw_3d <- function(cop, ttl = "", n = 30) {
+  u_seq <- seq(1e-4, 1 - 1e-4, length.out = n)
+  grid  <- as.matrix(expand.grid(u1 = u_seq, u2 = u_seq))
+  z_mat <- matrix(log(dCopula(grid, cop)), nrow = n)
+  par(pty = "m")
+  persp(u_seq, u_seq, z_mat, theta = 40, phi = 25, expand = 0.6,
+        col = "steelblue", shade = 0.4, border = NA,
+        xlab = "u", ylab = "v", zlab = "log c(u,v)", main = ttl,
+        ticktype = "detailed")
+}
+
+draw_contour <- function(cop, ttl = "", n = 60) {
+  u_seq <- seq(0.01, 0.99, length.out = n)
+  grid  <- expand.grid(u1 = u_seq, u2 = u_seq)
+  z_mat <- matrix(log(dCopula(as.matrix(grid), cop)), nrow = n)
+  pal   <- hcl.colors(64, "YlOrRd", rev = TRUE)
+  par(pty = "s")
+  image(u_seq, u_seq, z_mat, col = pal, xlim = c(0,1), ylim = c(0,1),
+        xlab = "u", ylab = "v", main = ttl)
+  clip(0, 1, 0, 1)
+  contour(u_seq, u_seq, z_mat, add = TRUE, nlevels = 10, col = "grey20", lwd = 0.6)
+  box()
+}
+
+draw_pickands <- function(cop, ttl = "", n = 200) {
+  s_seq  <- seq(0.001, 0.999, length.out = n)
+  A_vals <- A(cop, s_seq)
+  lower  <- pmax(s_seq, 1 - s_seq)
+  plot(s_seq, A_vals, type = "n", xlim = c(0,1), ylim = c(0.25, 1.25),
+       xlab = "s", ylab = "A(s)", main = ttl, asp = 1)
+  polygon(c(s_seq, rev(s_seq)), c(rep(1, length(s_seq)), rev(lower)),
+          col = "grey88", border = NA)
+  lines(s_seq, lower, col = "tomato",      lwd = 1.5, lty = 2)
+  abline(h = 1,       col = "forestgreen", lwd = 1.5, lty = 3)
+  lines(s_seq, A_vals, col = "steelblue",  lwd = 2)
+  legend("bottomleft", legend = c("A(s)", "max{s,1-s}", "1"),
+         col = c("steelblue","tomato","forestgreen"),
+         lwd = c(2,1.5,1.5), lty = c(1,2,3), bty = "n", cex = 0.75)
+  box()
+}
+
+select_best_copula <- function(u1, u2) {
+  umat <- cbind(u1, u2)
+  candidates <- list(
+    list(nm = "Gumbel",       cop0 = gumbelCopula(),      k = 1),
+    list(nm = "Galambos",     cop0 = galambosCopula(),    k = 1),
+    list(nm = "Husler-Reiss", cop0 = huslerReissCopula(), k = 1),
+    list(nm = "tEV",          cop0 = tevCopula(),          k = 2),
+    list(nm = "Tawn",         cop0 = tawnCopula(),         k = 2)
+  )
+  results <- data.frame(copula = character(), AIC = numeric(),
+                        loglik = numeric(), k = integer(),
+                        stringsAsFactors = FALSE)
+  fitted  <- list()
+  for (cand in candidates) {
+    fit <- tryCatch(fitCopula(cand$cop0, umat, method = "mpl",
+                              optim.control = list(maxit = 500)),
+                   error = function(e) NULL)
+    if (is.null(fit)) next
+    ll <- tryCatch(logLik(fit)[1], error = function(e) NA)
+    if (is.na(ll) || !is.finite(ll)) next
+    aic <- 2 * cand$k - 2 * ll
+    results <- rbind(results, data.frame(copula = cand$nm, AIC = aic,
+                                         loglik = ll, k = cand$k))
+    fitted[[cand$nm]] <- fit@copula
+  }
+  if (nrow(results) == 0) stop("No copula converged!")
+  best_nm <- results$copula[which.min(results$AIC)]
+  list(results = results, best = best_nm, fitted = fitted)
+}
+```
+
+```{r fit-copulas, cache=TRUE}
+pairs_list    <- combn(station_names, 2, simplify = FALSE)
+selection_log <- data.frame()
+fitted_pairs  <- list()
+
+for (pair in pairs_list) {
+  s1 <- pair[1]; s2 <- pair[2]
+  sel <- select_best_copula(U_matrix[, s1], U_matrix[, s2])
+  selection_log <- rbind(selection_log,
+                         data.frame(Station1 = s1, Station2 = s2,
+                                    Best_copula = sel$best,
+                                    AIC = round(min(sel$results$AIC), 2)))
+  fitted_pairs[[paste(s1, s2, sep = "_")]] <- sel$fitted[[sel$best]]
+}
+```
+
+### Summary of Selected Copulas
+
+```{r copula-summary-table}
+selection_log %>%
+  kable(col.names = c("Station 1", "Station 2", "Selected copula", "AIC"),
+        caption = "Best-fitting extreme value copula per station pair (minimum AIC).") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+Hüsler–Reiss was selected for 6 of 10 pairs, t-EV for 3, and Gumbel for 1
+(Groningen–Den Helder). Geographically close pairs — particularly Hoofddorp–Putten
+(63 km, t-EV) and Den Helder–Hoofddorp (69 km, t-EV) — show the strongest dependence,
+captured by t-EV which allows for tail dependence. More distant pairs are described by
+Hüsler–Reiss with weaker dependence. All Pickands functions lie in [0.88, 1.00],
+confirming weak to moderate tail dependence throughout.
+
+### Copula Diagnostic Plots (All Pairs)
+
+```{r copula-diagnostics, fig.height=5, fig.cap="3D log-density, contour plot, and Pickands function A(s) for each station pair."}
+for (pair in pairs_list) {
+  s1  <- pair[1]; s2 <- pair[2]
+  key <- paste(s1, s2, sep = "_")
+  cop <- fitted_pairs[[key]]
+  best_nm <- selection_log$Best_copula[selection_log$Station1 == s1 &
+                                       selection_log$Station2 == s2]
+
+  par(mfrow = c(1, 3), mar = c(4, 4, 3.5, 1), oma = c(0, 0, 3, 0))
+  draw_3d(cop,      "3D log-density log c(u,v)")
+  draw_contour(cop, "Contour plot log c(u,v)")
+  draw_pickands(cop, "Pickands function A(s)")
+  mtext(paste0(best_nm, "  [", s1, " × ", s2, "]  (selected by AIC)"),
+        outer = TRUE, cex = 1.1, font = 2)
+}
+```
+
+---
+
+## Risk Metrics from Bivariate Copulas
+
+We estimate the probability of simultaneously exceeding 80 mm at both stations
+in a given year, and the corresponding joint return period. These cannot be
+computed analytically for all families, so Monte Carlo simulation is used
+($10^6$ draws per pair, seeds fixed for reproducibility).
+
+```{r copula-probs, cache=TRUE}
+u_vals  <- sapply(station_names, function(s) {
+  pars <- params_table[params_table$Station == s, ]
+  pgev(THRESHOLD, pars$mu, pars$sigma, pars$xi)
+})
+p_exceed <- 1 - u_vals
+t_d1     <- 1 / p_exceed
+
+p_simulation <- function(cop, u_vals, n_sim = 1e6, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  d   <- length(u_vals)
+  sim <- rCopula(n_sim, cop)
+  mean(rowSums(sim > matrix(u_vals, nrow = n_sim, ncol = d, byrow = TRUE)) == d)
+}
+
+pair_p <- matrix(NA, n_stations, n_stations,
+                 dimnames = list(station_names, station_names))
+pair_T <- matrix(NA, n_stations, n_stations,
+                 dimnames = list(station_names, station_names))
+diag(pair_p) <- p_exceed
+diag(pair_T) <- t_d1
+
+for (i in 1:(n_stations - 1)) for (j in (i+1):n_stations) {
+  s1 <- station_names[i]; s2 <- station_names[j]
+  cop_ij <- fitted_pairs[[paste(s1, s2, sep = "_")]]
+  p_ij   <- p_simulation(cop_ij, c(u_vals[i], u_vals[j]),
+                         n_sim = 1e6, seed = 123 + i*10 + j)
+  pair_p[i,j] <- pair_p[j,i] <- p_ij
+  pair_T[i,j] <- pair_T[j,i] <- 1 / p_ij
+}
+```
+
+```{r bivariate-prob-table}
+round(pair_p, 5) %>%
+  kable(caption = "Joint annual probability of simultaneously exceeding 80 mm.
+        Diagonal = marginal exceedance probabilities.") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+```{r bivariate-rt-table}
+round(pair_T, 1) %>%
+  kable(caption = "Joint return period for simultaneous exceedance of 80 mm (years).
+        Diagonal = marginal return periods.") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+```{r ratio-table}
+ratio_pairs <- matrix(NA, n_stations, n_stations,
+                      dimnames = list(station_names, station_names))
+for (i in 1:(n_stations-1)) for (j in (i+1):n_stations) {
+  ratio_pairs[i,j] <- pair_p[i,j] / (p_exceed[i] * p_exceed[j])
+  ratio_pairs[j,i] <- ratio_pairs[i,j]
+}
+
+round(ratio_pairs, 1) %>%
+  kable(caption = "Ratio of copula-implied joint probability to independence assumption.
+        Values >> 1 indicate that ignoring dependence severely underestimates risk.") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+**Key finding for cat modelling:** Although the fitted copulas exhibit only weak tail dependence — with Pickands functions lying close to 1 throughout — the copula-implied joint exceedance probability is **14× to 98× higher** than under the independence assumption. The Hoofddorp–Groningen pair shows the largest amplification (~98×), despite having one of the lower Spearman correlations (ρ = 0.14). This illustrates a general property of extreme value copulas: even marginal dependence in the tail can have an outsized effect on joint exceedance probabilities, because both marginal probabilities are already very small and any positive association compounds multiplicatively.
+In a cat modelling context, this matters at every stage of the risk chain. An excess of loss reinsurance structure priced under independence would systematically understate the probability of simultaneous losses across locations, leading to insufficient attachment points and underpriced aggregate covers. PML estimates at the 1-in-200 level — used for regulatory capital under Solvency II — would similarly be understated.
+
+---
+
+## 5-Dimensional Gumbel Copula
+
+The `copula` package supports only the Gumbel copula for dimensions > 2 among extreme
+value families. A 5D Gumbel copula is fitted to capture the joint behaviour of all
+five stations simultaneously.
+
+```{r fit-5d, cache=TRUE}
+fit_5d <- fitCopula(gumbelCopula(dim = 5), U_matrix, method = "mpl",
+                    optim.control = list(maxit = 1000))
+cop5d <- fit_5d@copula
+
+cat(sprintf("θ = %.4f,  Kendall's τ = %.4f,  loglik = %.2f,  AIC = %.2f\n",
+            coef(fit_5d), tau(cop5d), logLik(fit_5d)[1],
+            2*1 - 2*logLik(fit_5d)[1]))
+
+P_5d       <- p_simulation(cop5d, u_vals, seed = 123)
+P_indep_5d <- prod(p_exceed)
+ratio_5d   <- P_5d / P_indep_5d
+
+fiveD_summary <- tibble(
+  Description = c("Joint P(all 5 > 80 mm) — copula",
+                  "Joint P(all 5 > 80 mm) — independence",
+                  "Joint return period (years)",
+                  "Ratio copula / independence"),
+  Value = c(P_5d, P_indep_5d, 1/P_5d, ratio_5d)
+)
+
+kable(fiveD_summary, digits = c(0, 10),
+      caption = "5-dimensional Gumbel copula.") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+The estimated $\hat\theta = 1.12$ is close to 1 (independence), yet the copula-implied
+joint probability is **~239 million times higher** than under independence.
+This demonstrates how, in high dimensions, even negligible dependence dramatically
+amplifies simultaneous extreme event probabilities — a critical consideration when
+pricing multi-location aggregate covers.
+
+**Caution:** Although the fitted 5D Gumbel copula indicates only very weak dependence (θ close to 1), the implied joint exceedance probability is several orders of magnitude higher than under independence. This highlights a key feature of high-dimensional extreme value modelling: even weak positive dependence can substantially amplify joint tail risk. The result should therefore be interpreted as an **illustration of sensitivity to dependence assumptions**, rather than as a fully reliable estimate due to the restrictive copula structure.
+
+---
+
+## Conclusions
+
+The analysis proceeds from individual station extremes to multivariate risk, following the structure of a catastrophe model hazard component. The main findings are summarised below, with emphasis on their practical implications for aggregate risk estimation.
+
+1. **Marginal extremes:** Annual maxima at all five stations are well described by GEV
+   distributions. Den Helder and Putten show heavier upper tails (ξ > 0 with CI excluding
+   zero). Non-stationarity in the mean is present at all stations, most markedly at
+   Roermond and Hoofddorp, which should be noted when interpreting return periods.
+
+2. **Dependence structure:** All pairwise dependencies are positive but weak
+   (Spearman's ρ ∈ [0.11, 0.24]). Proximity matters but is not the only driver.
+   Extremes show weaker spatial correlation than daily totals, consistent with
+   extreme precipitation being driven by localised meteorological systems.
+
+3. **Copula selection:** Hüsler–Reiss dominates (6/10 pairs), t-EV appears for the
+   three geographically closest pairs. All Pickands functions lie near 1, indicating
+   weak but non-zero upper tail dependence.
+
+4. **Risk amplification:** Despite weak dependence, the copula-implied joint exceedance
+   probability is 14–98× higher than under independence for station pairs, and ~239
+   million× higher in the 5D case. **These findings indicate that ignoring spatial
+   dependence in extreme precipitation modelling may lead to systematic underestimation 
+   of aggregate tail risk in excess-of-loss pricing structures.**
+
+Taken together, these results suggest that a naive independence assumption — which remains common in simplified pricing models — can understate joint exceedance probabilities by one to two orders of magnitude even when pairwise correlations appear negligible. The vine copula and spatial hierarchical extensions outlined in the introduction would allow this framework to scale to larger station networks and produce the spatial return-level maps required for full stochastic event set generation.
+
+---
+
+## References
+
+::: {#refs}
+:::
+
+```{r session-info, include=FALSE}
+sessionInfo()
+```
